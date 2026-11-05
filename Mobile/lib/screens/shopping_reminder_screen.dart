@@ -1,0 +1,739 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_screenutil/flutter_screenutil.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
+import '../data/services/api_service.dart';
+import '../l10n/app_localizations.dart';
+import '../widgets/friggy_app_bar.dart';
+import '../sqlite/services/shopping_local_service.dart';
+import '../sqlite/services/ingredient_local_service.dart';
+import '../sqlite/models/local_shopping_model.dart';
+import '../sqlite/models/local_ingredient_model.dart';
+
+class ShoppingItemModel {
+  int? backendItemId;
+  String id;
+  String name;
+  String? quantity;
+  bool isChecked;
+
+  ShoppingItemModel({
+    this.backendItemId,
+    required this.id,
+    required this.name,
+    this.quantity,
+    this.isChecked = false,
+  });
+}
+
+class ShoppingReminderScreen extends StatefulWidget {
+  const ShoppingReminderScreen({super.key});
+
+  @override
+  State<ShoppingReminderScreen> createState() => _ShoppingReminderScreenState();
+}
+
+class _ShoppingReminderScreenState extends State<ShoppingReminderScreen> {
+  final TextEditingController _addItemController = TextEditingController();
+
+  bool _isLoading = true;
+  String? _currentListId;
+  List<ShoppingItemModel> _shoppingList = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchShoppingLists();
+  }
+
+  Future<void> _fetchShoppingLists() async {
+    setState(() {
+      _isLoading = true;
+    });
+
+    final shoppingLocalService = ShoppingLocalService();
+
+    try {
+      final lists = await ApiService().getShoppingLists();
+      if (lists.isNotEmpty) {
+        final firstList = lists.first as Map<String, dynamic>;
+        final listId = firstList['id']?.toString();
+        final rawItems = firstList['items'] as List<dynamic>? ?? [];
+
+        final List<ShoppingItemModel> loadedItems = [];
+        final List<LocalShoppingItemModel> localItems = [];
+
+        for (final item in rawItems) {
+          final itemMap = item as Map<String, dynamic>;
+          final bId = itemMap['id'] as int?;
+          final name = itemMap['ingredientName']?.toString() ?? 'Nguyên liệu';
+          final qtyNum = itemMap['quantity'];
+          final unitStr = itemMap['unit']?.toString() ?? '';
+          final qtyStr = qtyNum != null ? '$qtyNum $unitStr'.trim() : null;
+          final isPurchased = itemMap['isPurchased'] as bool? ?? false;
+
+          loadedItems.add(
+            ShoppingItemModel(
+              backendItemId: bId,
+              id: bId?.toString() ?? DateTime.now().millisecondsSinceEpoch.toString(),
+              name: name,
+              quantity: qtyStr,
+              isChecked: isPurchased,
+            ),
+          );
+
+          localItems.add(
+            LocalShoppingItemModel(
+              id: bId?.toString() ?? DateTime.now().millisecondsSinceEpoch.toString(),
+              ingredientId: itemMap['ingredientId'] as int? ?? 0,
+              ingredientName: name,
+              quantity: (qtyNum as num?)?.toDouble() ?? 1.0,
+              unit: unitStr,
+              isPurchased: isPurchased,
+              updatedAt: DateTime.now().millisecondsSinceEpoch,
+              syncStatus: 'synced',
+              listId: listId,           // lưu để dùng khi toggle offline
+              backendItemId: bId,       // lưu để dùng khi toggle offline
+            ),
+          );
+        }
+
+        // Save to SQLite
+        await shoppingLocalService.saveShoppingItemsOverwrite(localItems);
+
+        if (mounted) {
+          setState(() {
+            _currentListId = listId;
+            _shoppingList = loadedItems;
+            _isLoading = false;
+          });
+        }
+        return;
+      }
+    } catch (e) {
+      debugPrint('[ShoppingReminderScreen] Error/Offline fetching shopping lists: $e. Loading from SQLite...');
+      try {
+        final cached = await shoppingLocalService.getCachedShoppingItems();
+        if (cached.isNotEmpty) {
+          final List<ShoppingItemModel> offlineItems = cached.map((item) {
+            return ShoppingItemModel(
+              id: item.id,
+              name: item.ingredientName,
+              quantity: '${item.quantity} ${item.unit}',
+              isChecked: item.isPurchased,
+            );
+          }).toList();
+
+          if (mounted) {
+            setState(() {
+              _shoppingList = offlineItems;
+              _isLoading = false;
+            });
+            return;
+          }
+        }
+      } catch (err) {
+        debugPrint('[ShoppingReminderScreen] SQLite read error: $err');
+      }
+    }
+
+    if (mounted) {
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _generateShoppingListFromLatestPlan() async {
+    setState(() {
+      _isLoading = true;
+    });
+
+    try {
+      final plans = await ApiService().getMealPlans();
+      if (plans.isNotEmpty && plans.first['id'] != null) {
+        final planId = plans.first['id'].toString();
+        await ApiService().createShoppingList(
+          weeklyPlanId: planId,
+          title: 'Danh sách mua sắm tuần này',
+        );
+        await _fetchShoppingLists();
+        return;
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Chưa có thực đơn tuần. Vui lòng tạo thực đơn trước!'),
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('[ShoppingReminderScreen] Error creating shopping list: $e');
+    }
+
+    if (mounted) {
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _addItemController.dispose();
+    super.dispose();
+  }
+
+  void _addNewItem(String name) {
+    final loc = AppLocalizations.of(context);
+    final isEn = loc?.locale.languageCode == 'en';
+    final trimmed = name.trim();
+    if (trimmed.isEmpty) return;
+
+    FocusScope.of(context).unfocus();
+
+    setState(() {
+      _shoppingList.insert(
+        0,
+        ShoppingItemModel(
+          id: DateTime.now().millisecondsSinceEpoch.toString(),
+          name: trimmed,
+          isChecked: false,
+        ),
+      );
+      _addItemController.clear();
+    });
+
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(isEn ? 'Added "$trimmed" to shopping list!' : 'Đã thêm "$trimmed" vào danh sách cần mua!'),
+        backgroundColor: const Color(0xFF008435),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(14.r),
+        ),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  Future<void> _toggleCheckItem(ShoppingItemModel item) async {
+    // Cập nhật UI ngay lập tức
+    setState(() {
+      item.isChecked = !item.isChecked;
+    });
+
+    final shoppingLocalService = ShoppingLocalService();
+    final ingredientLocalService = IngredientLocalService();
+
+    // Kiểm tra kết nối mạng
+    final connectivity = await Connectivity().checkConnectivity();
+    final isOnline = connectivity.contains(ConnectivityResult.wifi) ||
+        connectivity.contains(ConnectivityResult.mobile) ||
+        connectivity.contains(ConnectivityResult.ethernet);
+
+    if (isOnline && _currentListId != null && item.backendItemId != null) {
+      // ONLINE: Gọi API toggle ngay, cập nhật SQLite thành synced
+      try {
+        await ApiService().toggleShoppingListItem(
+          listId: _currentListId!,
+          itemId: item.backendItemId!,
+        );
+        await shoppingLocalService.markToggleSynced(item.id);
+        // Nếu online check → xóa shopping_tick cũ nếu có (tủ lạnh sẽ pull data thật từ server)
+        if (item.isChecked) {
+          await ingredientLocalService.clearShoppingTickByName(item.name);
+        }
+        debugPrint('[ShoppingReminderScreen] Toggle synced online: ${item.name}');
+      } catch (e) {
+        debugPrint('[ShoppingReminderScreen] Error toggling item online: $e');
+        // Nếu lỗi API → lưu pending_toggle và cập nhật tủ lạnh offline
+        await shoppingLocalService.markPendingToggle(item.id, item.isChecked);
+        await _updateFridgeForOfflineTick(item, ingredientLocalService);
+      }
+    } else {
+      // OFFLINE: Lưu trạng thái pending_toggle vào SQLite
+      await shoppingLocalService.markPendingToggle(item.id, item.isChecked);
+      // Cập nhật hiển thị tủ lạnh offline
+      await _updateFridgeForOfflineTick(item, ingredientLocalService);
+      debugPrint('[ShoppingReminderScreen] Offline toggle saved as pending: ${item.name}');
+    }
+  }
+
+  /// Khi offline tick → thêm vào local_ingredients (shopping_tick) để hiển thị tủ lạnh
+  /// Khi bỏ tick → xóa khỏi local_ingredients
+  Future<void> _updateFridgeForOfflineTick(
+    ShoppingItemModel item,
+    IngredientLocalService ingredientSvc,
+  ) async {
+    if (item.isChecked) {
+      // Đánh dấu đã mua → thêm vào tủ lạnh SQLite với shopping_tick
+      final now = DateTime.now().millisecondsSinceEpoch;
+      // Tính quantity từ cậu trúc item.quantity (ví dụ: '1.5 kg')
+      double qty = 1.0;
+      String unit = 'cái';
+      if (item.quantity != null && item.quantity!.isNotEmpty) {
+        final parts = item.quantity!.trim().split(' ');
+        qty = double.tryParse(parts.first) ?? 1.0;
+        if (parts.length > 1) unit = parts.sublist(1).join(' ');
+      }
+      final fridgeEntry = LocalIngredientModel(
+        id: 'shopping_tick_${item.id}',
+        ingredientId: 0,
+        name: item.name,
+        quantity: qty,
+        unit: unit,
+        storageLocation: 'fridge',
+        updatedAt: now,
+        syncStatus: 'shopping_tick',
+      );
+      await ingredientSvc.saveOfflineIngredient(fridgeEntry);
+      debugPrint('[ShoppingReminderScreen] Added "${item.name}" to fridge (shopping_tick).');
+    } else {
+      // Bỏ tick → xóa khỏi tủ lạnh offline
+      await ingredientSvc.clearShoppingTickByName(item.name);
+      debugPrint('[ShoppingReminderScreen] Removed "${item.name}" from fridge (uncheck offline).');
+    }
+  }
+
+  void _deleteItem(ShoppingItemModel item) {
+    final loc = AppLocalizations.of(context);
+    final isEn = loc?.locale.languageCode == 'en';
+    setState(() {
+      _shoppingList.removeWhere((element) => element.id == item.id);
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(isEn ? 'Deleted "${item.name}" from list!' : 'Đã xóa "${item.name}" khỏi danh sách!'),
+        backgroundColor: const Color(0xFFD32F2F),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final loc = AppLocalizations.of(context);
+    final isEn = loc?.locale.languageCode == 'en';
+
+    return Scaffold(
+      body: Container(
+        width: double.infinity,
+        height: double.infinity,
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: isDark
+                ? const [
+                    Color(0xFF0E1611),
+                    Color(0xFF142017),
+                    Color(0xFF1B2E21),
+                  ]
+                : const [
+                    Color(0xFFFFFFFF),
+                    Color(0xFFF5FCF4),
+                    Color(0xFFC7EFC2),
+                    Color(0xFF86D978),
+                    Color(0xFF4CB93E),
+                  ],
+            stops: isDark ? const [0.0, 0.5, 1.0] : const [0.0, 0.24, 0.42, 0.72, 1.0],
+          ),
+        ),
+        child: SafeArea(
+          child: Column(
+            children: [
+              const FriggyAppBar(),
+
+              Expanded(
+                child: SingleChildScrollView(
+                  physics: const BouncingScrollPhysics(),
+                  padding: EdgeInsets.symmetric(horizontal: 20.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      SizedBox(height: 6.h),
+
+                      Text(
+                        isEn ? 'Shopping Reminder' : 'Nhắc đi chợ',
+                        style: GoogleFonts.plusJakartaSans(
+                          fontSize: 32.sp,
+                          fontWeight: FontWeight.w900,
+                          color: isDark ? Colors.white : const Color(0xFF006428),
+                          letterSpacing: -0.5,
+                        ),
+                      ),
+                      SizedBox(height: 2.h),
+                      Text(
+                        isEn
+                            ? 'Create your shopping list for next week with Friggy!'
+                            : 'Lên danh sách mua sắm cho tuần tới cùng Friggy nhé!',
+                        style: GoogleFonts.plusJakartaSans(
+                          fontSize: 13.5.sp,
+                          fontWeight: FontWeight.w600,
+                          fontStyle: FontStyle.italic,
+                          color: isDark
+                              ? const Color(0xFF9DA8A0)
+                              : const Color(0xFF1B5E20),
+                        ),
+                      ),
+
+                      SizedBox(height: 12.h),
+
+                      Stack(
+                        clipBehavior: Clip.none,
+                        children: [
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              SizedBox(height: 12.h),
+
+                              Container(
+                                width: double.infinity,
+                                padding: EdgeInsets.only(
+                                  left: 18.w,
+                                  right: 105.w,
+                                  top: 22.h,
+                                  bottom: 22.h,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: isDark
+                                      ? const Color(0xFF1E3A25)
+                                      : const Color(0xFF52B756),
+                                  borderRadius: BorderRadius.circular(24.r),
+                                  border: isDark
+                                      ? Border.all(
+                                          color: const Color(0xFF2E4D36),
+                                          width: 1.5)
+                                      : null,
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: Colors.black
+                                          .withValues(alpha: isDark ? 0.2 : 0.08),
+                                      blurRadius: 10,
+                                      offset: const Offset(0, 4),
+                                    ),
+                                  ],
+                                ),
+                                child: Text(
+                                  isEn
+                                      ? 'Friggy prepared a few\nshopping suggestions for you!'
+                                      : 'Friggy đã chuẩn bị danh sách\nmua sắm từ thực đơn AI nè!',
+                                  style: GoogleFonts.plusJakartaSans(
+                                    fontSize: 14.5.sp,
+                                    fontWeight: FontWeight.w800,
+                                    color: Colors.white,
+                                    height: 1.35,
+                                  ),
+                                ),
+                              ),
+
+                              SizedBox(height: 16.h),
+
+                              Text(
+                                isEn ? 'Add to update' : 'Nhập thêm để cập nhật',
+                                style: GoogleFonts.plusJakartaSans(
+                                  fontSize: 14.5.sp,
+                                  fontWeight: FontWeight.w800,
+                                  color: isDark ? Colors.white : const Color(0xFF006428),
+                                ),
+                              ),
+                              SizedBox(height: 8.h),
+
+                              Padding(
+                                padding: EdgeInsets.only(right: 96.0.w),
+                                child: Container(
+                                  height: 48,
+                                  padding: EdgeInsets.only(left: 14.w, right: 4.w),
+                                  decoration: BoxDecoration(
+                                    color: isDark
+                                        ? const Color(0xFF19271E)
+                                        : Colors.white,
+                                    borderRadius: BorderRadius.circular(28.r),
+                                    border: Border.all(
+                                      color: isDark
+                                          ? const Color(0xFF2E4D36)
+                                          : const Color(0xFF81C784),
+                                      width: 1.2,
+                                    ),
+                                    boxShadow: [
+                                      BoxShadow(
+                                        color: Colors.black
+                                            .withValues(alpha: isDark ? 0.2 : 0.04),
+                                        blurRadius: 8,
+                                        offset: const Offset(0, 3),
+                                      ),
+                                    ],
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      Expanded(
+                                        child: TextField(
+                                          controller: _addItemController,
+                                          onSubmitted: _addNewItem,
+                                          style: GoogleFonts.plusJakartaSans(
+                                            fontSize: 13.5.sp,
+                                            fontWeight: FontWeight.w600,
+                                            color: isDark ? Colors.white : const Color(0xFF19221C),
+                                          ),
+                                          decoration: InputDecoration(
+                                            hintText: isEn
+                                                ? 'Enter item you want to buy'
+                                                : 'Nhập thực phẩm bạn muốn mua',
+                                            hintStyle: GoogleFonts.plusJakartaSans(
+                                              fontSize: 12.5.sp,
+                                              color: isDark
+                                                  ? const Color(0xFF9DA8A0)
+                                                  : const Color(0xFFA5D6A7),
+                                            ),
+                                            border: InputBorder.none,
+                                            contentPadding: EdgeInsets.symmetric(vertical: 10),
+                                          ),
+                                        ),
+                                      ),
+                                      Material(
+                                        color: Colors.transparent,
+                                        child: InkWell(
+                                          onTap: () => _addNewItem(_addItemController.text),
+                                          borderRadius: BorderRadius.circular(20.r),
+                                          child: Container(
+                                            width: 40,
+                                            height: 40,
+                                            decoration: BoxDecoration(
+                                              color: Color(0xFF4CAF50),
+                                              shape: BoxShape.circle,
+                                            ),
+                                            child: const Icon(
+                                              Icons.add_rounded,
+                                              color: Colors.white,
+                                              size: 26,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+
+                          Positioned(
+                            right: -2,
+                            top: -2,
+                            bottom: -18,
+                            width: 136,
+                            child: Image.asset(
+                              'assets/images/suggest.png',
+                              fit: BoxFit.contain,
+                              alignment: Alignment.centerRight,
+                              errorBuilder: (context, error, stackTrace) => const Icon(
+                                Icons.shopping_bag_rounded,
+                                size: 64,
+                                color: Colors.white30,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+
+                      SizedBox(height: 22.h),
+
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            isEn ? 'Shopping List' : 'Danh sách cần mua',
+                            style: GoogleFonts.plusJakartaSans(
+                              fontSize: 22.sp,
+                              fontWeight: FontWeight.w900,
+                              color: isDark ? Colors.white : const Color(0xFF006428),
+                            ),
+                          ),
+                          ElevatedButton.icon(
+                            onPressed: _generateShoppingListFromLatestPlan,
+                            icon: const Icon(Icons.auto_awesome, size: 16),
+                            label: Text(
+                              isEn ? 'Sync Plan' : 'Tạo từ AI',
+                              style: GoogleFonts.plusJakartaSans(fontSize: 12.sp, fontWeight: FontWeight.bold),
+                            ),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF008435),
+                              foregroundColor: Colors.white,
+                              padding: EdgeInsets.symmetric(horizontal: 10.w, vertical: 6.h),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16.r)),
+                            ),
+                          ),
+                        ],
+                      ),
+
+                      SizedBox(height: 12.h),
+
+                      if (_isLoading)
+                        const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 20),
+                          child: Center(
+                            child: CircularProgressIndicator(color: Color(0xFF008435)),
+                          ),
+                        )
+                      else if (_shoppingList.isEmpty)
+                        Container(
+                          width: double.infinity,
+                          padding: EdgeInsets.all(24.w),
+                          decoration: BoxDecoration(
+                            color: isDark ? const Color(0xFF19271E) : Colors.white,
+                            borderRadius: BorderRadius.circular(20.r),
+                          ),
+                          child: Column(
+                            children: [
+                              Icon(
+                                Icons.shopping_cart_outlined,
+                                size: 48,
+                                color: isDark ? const Color(0xFF81C784) : const Color(0xFF2E7D32),
+                              ),
+                              SizedBox(height: 12.h),
+                              Text(
+                                isEn
+                                    ? 'No shopping list yet. Tap "Sync Plan" to generate!'
+                                    : 'Chưa có danh sách cần mua. Bấm "Tạo từ AI" để tổng hợp!',
+                                textAlign: TextAlign.center,
+                                style: GoogleFonts.plusJakartaSans(
+                                  fontSize: 14.sp,
+                                  fontWeight: FontWeight.w600,
+                                  color: isDark ? Colors.white70 : const Color(0xFF2E7D32),
+                                ),
+                              ),
+                            ],
+                          ),
+                        )
+                      else
+                        ListView.separated(
+                          shrinkWrap: true,
+                          physics: const NeverScrollableScrollPhysics(),
+                          itemCount: _shoppingList.length,
+                          separatorBuilder: (context, index) => SizedBox(height: 10.h),
+                          itemBuilder: (context, index) {
+                            final item = _shoppingList[index];
+                            return _buildShoppingItemCard(item, isDark);
+                          },
+                        ),
+
+                      SizedBox(height: 24.h),
+
+                      Center(
+                        child: Image.asset(
+                          'assets/images/market.png',
+                          width: double.infinity,
+                          height: 210,
+                          fit: BoxFit.contain,
+                          errorBuilder: (context, error, stackTrace) => const Icon(
+                            Icons.storefront_rounded,
+                            size: 100,
+                            color: Colors.white30,
+                          ),
+                        ),
+                      ),
+
+                      SizedBox(height: 18.h),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildShoppingItemCard(ShoppingItemModel item, bool isDark) {
+    return Container(
+      padding: EdgeInsets.symmetric(horizontal: 14.w, vertical: 12.h),
+      decoration: BoxDecoration(
+        color: isDark ? const Color(0xFF19271E) : Colors.white,
+        borderRadius: BorderRadius.circular(22.r),
+        border: Border.all(
+          color: isDark
+              ? const Color(0xFF2E4D36)
+              : (item.isChecked ? const Color(0xFFA5D6A7) : const Color(0xFF81C784)),
+          width: 1.2,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: isDark ? 0.2 : 0.04),
+            blurRadius: 8,
+            offset: const Offset(0, 3),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          GestureDetector(
+            onTap: () => _toggleCheckItem(item),
+            child: Container(
+              width: 26,
+              height: 26,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: item.isChecked ? const Color(0xFF4CAF50) : Colors.transparent,
+                border: Border.all(
+                  color: item.isChecked
+                      ? const Color(0xFF4CAF50)
+                      : (isDark ? const Color(0xFF6B786F) : const Color(0xFF9E9E9E)),
+                  width: 2,
+                ),
+              ),
+              child: item.isChecked
+                  ? const Icon(
+                      Icons.check_rounded,
+                      size: 16,
+                      color: Colors.white,
+                    )
+                  : null,
+            ),
+          ),
+          SizedBox(width: 14.w),
+
+          Expanded(
+            child: Text(
+              item.name,
+              style: GoogleFonts.plusJakartaSans(
+                fontSize: 16.sp,
+                fontWeight: FontWeight.w700,
+                color: item.isChecked
+                    ? (isDark ? const Color(0xFF6B786F) : const Color(0xFF757575))
+                    : (isDark ? Colors.white : const Color(0xFF19221C)),
+                decoration: item.isChecked ? TextDecoration.lineThrough : null,
+              ),
+            ),
+          ),
+
+          if (item.quantity != null && item.quantity!.isNotEmpty) ...[
+            Container(
+              padding: EdgeInsets.symmetric(horizontal: 10.w, vertical: 4.h),
+              decoration: BoxDecoration(
+                color: isDark ? const Color(0xFF233629) : const Color(0xFFE8F5E9),
+                borderRadius: BorderRadius.circular(12.r),
+              ),
+              child: Text(
+                item.quantity!,
+                style: GoogleFonts.plusJakartaSans(
+                  fontSize: 12.5.sp,
+                  fontWeight: FontWeight.w700,
+                  color: isDark ? const Color(0xFF81C784) : const Color(0xFF2E7D32),
+                ),
+              ),
+            ),
+            SizedBox(width: 8.w),
+          ],
+
+
+        ],
+      ),
+    );
+}
+}
